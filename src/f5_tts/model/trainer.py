@@ -9,6 +9,7 @@ import torchaudio
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.logging import get_logger
 from ema_pytorch import EMA
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
@@ -20,6 +21,8 @@ from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
 # trainer
+
+logger = get_logger(__name__)
 
 
 class Trainer:
@@ -136,40 +139,44 @@ class Trainer:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
+    def debug(self, *args, **kwargs):
+        logger.info("%d %s", self.accelerator.process_index, *args, **kwargs, main_process_only=False)
+
     @property
     def is_main(self):
         return self.accelerator.is_main_process
 
     def save_checkpoint(self, update, last=False):
-        self.accelerator.wait_for_everyone()
-        if self.is_main:
-            checkpoint = dict(
-                model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
-                optimizer_state_dict=self.accelerator.unwrap_model(self.optimizer).state_dict(),
-                ema_model_state_dict=self.ema_model.state_dict(),
-                scheduler_state_dict=self.scheduler.state_dict(),
-                update=update,
-            )
-            if not os.path.exists(self.checkpoint_path):
-                os.makedirs(self.checkpoint_path)
-            if last:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
-                print(f"Saved last checkpoint at update {update}")
-            else:
-                if self.keep_last_n_checkpoints == 0:
-                    return
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{update}.pt")
-                if self.keep_last_n_checkpoints > 0:
-                    checkpoints = [
-                        f
-                        for f in os.listdir(self.checkpoint_path)
-                        if f.startswith("model_") and f.endswith(".pt") and f != "model_last.pt"
-                    ]
-                    checkpoints.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))
-                    while len(checkpoints) > self.keep_last_n_checkpoints:
-                        oldest_checkpoint = checkpoints.pop(0)
-                        os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
-                        print(f"Removed old checkpoint: {oldest_checkpoint}")
+        checkpoint = dict(
+            model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
+            optimizer_state_dict=self.accelerator.unwrap_model(self.optimizer).state_dict(),
+            ema_model_state_dict=self.ema_model.state_dict(),
+            scheduler_state_dict=self.scheduler.state_dict(),
+            update=update,
+        )
+        if not os.path.exists(self.checkpoint_path):
+            os.makedirs(self.checkpoint_path)
+        if last:
+            self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
+            print(f"Saved last checkpoint at update {update}")
+        else:
+            if self.keep_last_n_checkpoints == 0:
+                return
+
+            self.debug("Going to save checkpoint")
+            self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{update}.pt")
+            self.debug("Saved checkpoint")
+            if self.keep_last_n_checkpoints > 0:
+                checkpoints = [
+                    f
+                    for f in os.listdir(self.checkpoint_path)
+                    if f.startswith("model_") and f.endswith(".pt") and f != "model_last.pt"
+                ]
+                checkpoints.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))
+                while len(checkpoints) > self.keep_last_n_checkpoints:
+                    oldest_checkpoint = checkpoints.pop(0)
+                    os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
+                    print(f"Removed old checkpoint: {oldest_checkpoint}")
 
     def load_checkpoint(self):
         if (
@@ -319,7 +326,8 @@ class Trainer:
                 initial=progress_bar_initial,
             )
 
-            for batch in current_dataloader:
+            for i, batch in enumerate(current_dataloader):
+                self.debug("Batch %d inputs %d targets %d mel_lengths %d " % (i, len(batch["text"]), batch["mel"].shape[1], len(batch["mel_lengths"])))
                 with self.accelerator.accumulate(self.model):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
@@ -336,7 +344,9 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
+                        self.debug("Clipping gradients started")
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self.debug("Clipping gradients finished")
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -349,7 +359,7 @@ class Trainer:
                     progress_bar.update(1)
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item())
 
-                if self.accelerator.is_local_main_process:
+                if self.is_main:
                     self.accelerator.log(
                         {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )
@@ -357,43 +367,47 @@ class Trainer:
                         self.writer.add_scalar("loss", loss.item(), global_update)
                         self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
 
+                self.accelerator.wait_for_everyone()
                 if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients:
-                    self.save_checkpoint(global_update)
+                    if self.is_main:
+                        self.save_checkpoint(global_update)
 
-                    if self.log_samples and self.accelerator.is_local_main_process:
-                        ref_audio_len = mel_lengths[0]
-                        infer_text = [
-                            text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
-                        ]
-                        with torch.inference_mode():
-                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
-                                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
-                                text=infer_text,
-                                duration=ref_audio_len * 2,
-                                steps=nfe_step,
-                                cfg_strength=cfg_strength,
-                                sway_sampling_coef=sway_sampling_coef,
+                        if self.log_samples:
+                            ref_audio_len = mel_lengths[0]
+                            infer_text = [
+                                text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
+                            ]
+                            with torch.inference_mode():
+                                generated, _ = self.accelerator.unwrap_model(self.model).sample(
+                                    cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
+                                    text=infer_text,
+                                    duration=ref_audio_len * 2,
+                                    steps=nfe_step,
+                                    cfg_strength=cfg_strength,
+                                    sway_sampling_coef=sway_sampling_coef,
+                                )
+                                generated = generated.to(torch.float32)
+                                gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
+                                ref_mel_spec = batch["mel"][0].unsqueeze(0)
+                                if self.vocoder_name == "vocos":
+                                    gen_audio = vocoder.decode(gen_mel_spec).cpu()
+                                    ref_audio = vocoder.decode(ref_mel_spec).cpu()
+                                elif self.vocoder_name == "bigvgan":
+                                    gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
+                                    ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+    
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
                             )
-                            generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                            ref_mel_spec = batch["mel"][0].unsqueeze(0)
-                            if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
-                                ref_audio = vocoder.decode(ref_mel_spec).cpu()
-                            elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
+                            )
 
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
-                        )
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
-                        )
 
-                if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
-                    self.save_checkpoint(global_update, last=True)
+                        self.save_checkpoint(global_update, last=True)
 
-        self.save_checkpoint(global_update, last=True)
+        self.accelerator.wait_for_everyone()
+        if self.is_main:
+            self.save_checkpoint(global_update, last=True)
 
         self.accelerator.end_training()
