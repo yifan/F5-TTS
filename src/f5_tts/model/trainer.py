@@ -55,7 +55,7 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
     ):
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
 
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
