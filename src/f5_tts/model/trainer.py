@@ -55,7 +55,7 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
     ):
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=)
 
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
@@ -158,7 +158,7 @@ class Trainer:
             os.makedirs(self.checkpoint_path)
         if last:
             self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
-            print(f"Saved last checkpoint at update {update}")
+            print(f"Saved last checkpoint at update {update}: {self.checkpoint_path}/model_last.pt")
         else:
             if self.keep_last_n_checkpoints == 0:
                 return
