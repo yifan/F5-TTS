@@ -140,7 +140,9 @@ class Trainer:
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
     def debug(self, *args, **kwargs):
-        logger.info("%d %s", self.accelerator.process_index, *args, **kwargs, main_process_only=False)
+        # debug use only
+        pass 
+        # logger.info("%d %s", self.accelerator.process_index, *args, **kwargs, main_process_only=False)
 
     @property
     def is_main(self):
@@ -352,14 +354,14 @@ class Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
-                if self.is_main and self.accelerator.sync_gradients:
-                    self.ema_model.update()
-
-                    global_update += 1
-                    progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
-
                 if self.is_main:
+                    if self.accelerator.sync_gradients:
+                        self.ema_model.update()
+    
+                        global_update += 1
+                        progress_bar.update(1)
+                        progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+
                     self.accelerator.log(
                         {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )
